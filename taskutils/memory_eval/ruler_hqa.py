@@ -76,6 +76,9 @@ def get_pred_with_conversation_trace(data, args, out_file):
     elif args.api == "rag":
         from utils.openai_retrieval import async_query_llm as async_query_llm
         from utils import extract_answer
+    elif args.api in {"resq", "resp"}:
+        from utils.resq import async_query_llm as async_query_llm
+        from utils import extract_answer
     else:
         print(f"Invalid API: {args.api}")
         raise ValueError
@@ -297,7 +300,10 @@ if __name__ == "__main__":
     parser.add_argument("--model", "-m", type=str, default="BytedTsinghua-SIA/RL-MemoryAgent-7B")
     parser.add_argument("--tokenizer", "-t", type=str, default="BytedTsinghua-SIA/RL-MemoryAgent-7B")
     parser.add_argument("--n_proc", "-n", type=int, default=64)
-    parser.add_argument("--api", "-a", type=str, default="recurrent")
+    parser.add_argument(
+        "--api", "-a", type=str, default="recurrent",
+        help="API backend: recurrent|infmem|openai|CPRS|rag|resq(resp)"
+    )
     parser.add_argument("--sampling", "-p", type=int, default=1)
     parser.add_argument('--force', action='store_true', help='force to overrite')
     args = parser.parse_args()
