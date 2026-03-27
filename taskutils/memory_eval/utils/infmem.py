@@ -1,7 +1,7 @@
 
 from .aio import get_async_client
 from utils import extract_solution
-from .envs import URL, API_KEY, RECURRENT_CHUNK_SIZE, RECURRENT_MAX_NEW, RECURRENT_MAX_CONTEXT_LEN,ENABLE_THINK,EARLY_STOP
+from .envs import URL, API_KEY, RECURRENT_CHUNK_SIZE, RECURRENT_MAX_NEW, RECURRENT_MAX_CONTEXT_LEN,ENABLE_THINK,EARLY_STOP,BM25_IMPL
 
 from openai import AsyncOpenAI
 
@@ -19,6 +19,10 @@ nltk.download('punkt')
 NO_MEMORY = "No previous memory"
 
 RETRIEVE_CHUNK_SIZE = 500      
+RETRIEVE_CHUNK_OVERLAP = 100
+BM25_MAX_PER_RECURRENT = 2
+BM25_DEDUP_JACCARD = 0.8
+BM25_CAND_MULTIPLIER = 6
 
 
 
@@ -198,8 +202,91 @@ def extract_answer(item):
 
 
 ########## tools ################
-def tokenize(text: str):
+def tokenize_legacy(text: str):
     return text.lower().split()
+
+def tokenize(text: str):
+    return tokenize_legacy(text)
+
+def tokenize_mixed(text: str):
+    lower_text = text.lower()
+    tokens = re.findall(r"[a-z0-9_]+", lower_text)
+    zh_chars = [ch for ch in lower_text if '\u4e00' <= ch <= '\u9fff']
+    if zh_chars:
+        tokens.extend(zh_chars)
+        tokens.extend(
+            zh_chars[i] + zh_chars[i + 1]
+            for i in range(len(zh_chars) - 1)
+        )
+    return tokens
+
+def _normalize_query(query: str, fallback: str):
+    if not isinstance(query, str):
+        return fallback
+    query = re.sub(r"[\r\n\t]+", " ", query).strip()
+    query = re.sub(r"\s+", " ", query)
+    return query or fallback
+
+def _clamp_top_k(top_k, default=8, min_k=3, max_k=20):
+    try:
+        top_k = int(top_k)
+    except Exception:
+        top_k = default
+    return max(min_k, min(max_k, top_k))
+
+def _jaccard(tokens_a, tokens_b):
+    set_a = set(tokens_a)
+    set_b = set(tokens_b)
+    union_size = len(set_a | set_b)
+    if union_size == 0:
+        return 0.0
+    return len(set_a & set_b) / union_size
+
+def _build_retrieve_corpus_legacy(input_ids, tokenizer, recurrent_chunks):
+    retrieve_docs = []
+    retrieve_meta = []
+    for rc in recurrent_chunks:
+        r_idx = rc["r_idx"]
+        start, end = rc["start"], rc["end"]
+        p = start
+        while p < end:
+            rs = p
+            re = min(end, p + RETRIEVE_CHUNK_SIZE)
+            sub_ids = input_ids[rs:re]
+            retrieve_docs.append(tokenizer.decode(sub_ids))
+            retrieve_meta.append({
+                "recurrent_idx": r_idx,
+                "start": rs,
+                "end": re,
+            })
+            p = re
+    return retrieve_docs, retrieve_meta
+
+def _build_retrieve_corpus_enhanced(input_ids, tokenizer, recurrent_chunks):
+    chunk_size = RETRIEVE_CHUNK_SIZE
+    overlap = min(RETRIEVE_CHUNK_OVERLAP, chunk_size - 1)
+    step = max(1, chunk_size - overlap)
+
+    retrieve_docs = []
+    retrieve_meta = []
+    for rc in recurrent_chunks:
+        r_idx = rc["r_idx"]
+        start, end = rc["start"], rc["end"]
+        p = start
+        while p < end:
+            rs = p
+            re = min(end, rs + chunk_size)
+            sub_ids = input_ids[rs:re]
+            retrieve_docs.append(tokenizer.decode(sub_ids))
+            retrieve_meta.append({
+                "recurrent_idx": r_idx,
+                "start": rs,
+                "end": re,
+            })
+            if re >= end:
+                break
+            p = min(end, rs + step)
+    return retrieve_docs, retrieve_meta
 
 def bm25_retrieve_for_recurrent_chunk(
     query: str,
@@ -220,6 +307,64 @@ def bm25_retrieve_for_recurrent_chunk(
                 
                 continue
         results.append(retrieve_docs[idx])
+        if len(results) >= top_k:
+            break
+    return results
+
+def bm25_retrieve_for_recurrent_chunk_enhanced(
+    query: str,
+    bm25_model: BM25Okapi,
+    retrieve_docs,
+    retrieve_meta,
+    retrieve_doc_tokens,
+    top_k: int,
+    exclude_recurrent_idx: int | None = None,
+):
+    q_tokens = tokenize_mixed(query)
+    if not q_tokens:
+        return []
+
+    scores = bm25_model.get_scores(q_tokens)
+    if len(scores) == 0:
+        return []
+
+    candidate_count = min(len(scores), max(40, top_k * BM25_CAND_MULTIPLIER))
+    candidate_idx = np.argpartition(-scores, candidate_count - 1)[:candidate_count]
+    candidate_idx = candidate_idx[np.argsort(-scores[candidate_idx])]
+
+    results = []
+    selected_tokens = []
+    per_recurrent = defaultdict(int)
+
+    for idx in candidate_idx:
+        if exclude_recurrent_idx is not None and retrieve_meta[idx]["recurrent_idx"] == exclude_recurrent_idx:
+            continue
+
+        recurrent_idx = retrieve_meta[idx]["recurrent_idx"]
+        if per_recurrent[recurrent_idx] >= BM25_MAX_PER_RECURRENT:
+            continue
+
+        candidate_tokens = retrieve_doc_tokens[idx]
+        if any(_jaccard(candidate_tokens, chosen_tokens) > BM25_DEDUP_JACCARD for chosen_tokens in selected_tokens):
+            continue
+
+        results.append(retrieve_docs[idx])
+        selected_tokens.append(candidate_tokens)
+        per_recurrent[recurrent_idx] += 1
+        if len(results) >= top_k:
+            break
+
+    if len(results) >= top_k:
+        return results
+
+    ranked = np.argsort(-scores)
+    for idx in ranked:
+        if exclude_recurrent_idx is not None and retrieve_meta[idx]["recurrent_idx"] == exclude_recurrent_idx:
+            continue
+        text = retrieve_docs[idx]
+        if text in results:
+            continue
+        results.append(text)
         if len(results) >= top_k:
             break
     return results
@@ -442,6 +587,7 @@ def _remove_trailing_comment_of_fn_args(fn_args: str) -> str:
 from typing import List, Dict, Tuple
 import json
 import os
+import time
 import openai
 import uuid
 import math
@@ -451,6 +597,10 @@ from collections import Counter, defaultdict
 from dotenv import load_dotenv
 from sklearn.metrics.pairwise import cosine_similarity
 from rank_bm25 import BM25Okapi
+try:
+    import psutil
+except Exception:
+    psutil = None
 
 
 
@@ -588,10 +738,137 @@ async def call_llm_text(session, model, text, temperature, top_p, max_len, stop=
 
 
 
+def default_tokenize_for_bm25(text: str):
+    # 简单 tokenizer：按字母数字/下划线切词，小写
+    # 你也可以换成你自己的 tokenize()
+    return re.findall(r"\w+", text.lower())
+
+def build_bm25_by_paragraphs(
+    context: str,
+    tokenizer,
+    tokenize_fn=default_tokenize_for_bm25,
+    keep_empty: bool = False,
+):
+    """
+    以 '\\n\\n' 切分 context，按段落构建 BM25。
+    返回:
+      bm25: BM25Okapi
+      docs: List[str] 每个段落文本
+      meta: List[dict] 段落在原文中的 char/token 范围等信息
+    """
+
+    # ---------- 1) 按 \n\n 切分 + 计算每段的 char span ----------
+    # 用 finditer 方式保留准确 char offset（而不是 split 丢位置信息）
+    # 规则：两个或以上换行当作段落分隔（更鲁棒）
+    sep_pat = re.compile(r"\n{2,}")
+
+    spans = []
+    last = 0
+    for m in sep_pat.finditer(context):
+        spans.append((last, m.start()))
+        last = m.end()
+    spans.append((last, len(context)))
+
+    docs = []
+    meta = []
+    for i, (cs, ce) in enumerate(spans):
+        para = context[cs:ce]
+        # 兼容：去掉首尾空白，但保留原始 char span
+        stripped = para.strip()
+        if (not keep_empty) and (stripped == ""):
+            continue
+        docs.append(stripped if stripped != "" else para)
+        meta.append({
+            "para_idx": i,
+            "char_start": cs,
+            "char_end": ce,
+        })
+
+    # ---------- 2) 可选：用 fast tokenizer 的 offset_mapping 得到 token span ----------
+    # 注意：offset_mapping 只有 fast tokenizer 才支持（例如 AutoTokenizer(..., use_fast=True)）
+    try:
+        enc = tokenizer(
+            context,
+            add_special_tokens=False,
+            return_offsets_mapping=True,
+        )
+        offsets = enc["offset_mapping"]  # List[Tuple[int,int]]
+        # offsets 的 index 就是 token index（与 enc["input_ids"] 对齐）
+        for m in meta:
+            cs, ce = m["char_start"], m["char_end"]
+            # 找到落在该段 char span 内的 token 范围
+            tok_indices = [
+                ti for ti, (ts, te) in enumerate(offsets)
+                if te > cs and ts < ce  # 与段落区间有交集
+            ]
+            if tok_indices:
+                m["token_start"] = tok_indices[0]
+                m["token_end"] = tok_indices[-1] + 1  # python slice end
+            else:
+                m["token_start"] = None
+                m["token_end"] = None
+    except Exception:
+        # tokenizer 不支持 offset_mapping 就跳过；BM25 不依赖这个
+        for m in meta:
+            m["token_start"] = None
+            m["token_end"] = None
+
+    # ---------- 3) 建 BM25 ----------
+    corpus_tokens = [tokenize_fn(doc) for doc in docs]
+    bm25 = BM25Okapi(corpus_tokens)
+
+    return bm25, docs, meta
 
 
 async def async_query_llm_multi_turn(item, model, tokenizer, temperature=0.7, top_p=0.95, stop=None):
     # model="gpt-4o-mini"
+    perf_sample_start = time.perf_counter()
+    process = psutil.Process(os.getpid()) if psutil is not None else None
+
+    def _get_rss_mb():
+        if process is None:
+            return None
+        try:
+            return process.memory_info().rss / (1024 ** 2)
+        except Exception:
+            return None
+
+    loop_perf = []
+    retrieval_total_s = 0.0
+    retrieval_mem_deltas_mb = []
+    retrieval_calls = 0
+    bm25_impl = BM25_IMPL
+    if bm25_impl not in {"legacy", "enhanced"}:
+        print(f"[BM25] Unexpected BM25_IMPL={bm25_impl!r}, fallback to 'enhanced'.")
+        bm25_impl = "enhanced"
+
+    def _build_perf():
+        sample_total_s = time.perf_counter() - perf_sample_start
+        avg_loop_s = (
+            sum(loop["loop_total_s"] for loop in loop_perf) / len(loop_perf)
+            if loop_perf
+            else 0.0
+        )
+        retrieval_mem_delta_avg_mb = (
+            sum(retrieval_mem_deltas_mb) / len(retrieval_mem_deltas_mb)
+            if retrieval_mem_deltas_mb
+            else 0.0
+        )
+        retrieval_mem_delta_max_mb = (
+            max(retrieval_mem_deltas_mb) if retrieval_mem_deltas_mb else 0.0
+        )
+        return {
+            "sample_total_s": sample_total_s,
+            "avg_loop_s": avg_loop_s,
+            "retrieval_total_s": retrieval_total_s,
+            "retrieval_calls": retrieval_calls,
+            "retrieval_mem_deltas_mb": retrieval_mem_deltas_mb,
+            "retrieval_mem_delta_avg_mb": retrieval_mem_delta_avg_mb,
+            "retrieval_mem_delta_max_mb": retrieval_mem_delta_max_mb,
+            "bm25_impl": bm25_impl,
+            "loops": loop_perf,
+        }
+
     idx = item["_id"]
     context = item["context"].strip() 
     
@@ -629,61 +906,64 @@ async def async_query_llm_multi_turn(item, model, tokenizer, temperature=0.7, to
 
         
         
-        retrieve_docs = []   
-        retrieve_meta = []   
-
-        for rc in recurrent_chunks:
-            r_idx = rc["r_idx"]
-            start, end = rc["start"], rc["end"]
-            p = start
-            while p < end:
-                rs = p
-                re = min(end, p + RETRIEVE_CHUNK_SIZE)
-                sub_ids = input_ids[rs:re]
-                text = tokenizer.decode(sub_ids)
-                retrieve_docs.append(text)
-                retrieve_meta.append({
-                    "recurrent_idx": r_idx,
-                    "start": rs,
-                    "end": re,
-                })
-                p = re
-
-        # === Step 2.3: build bm25 index） ===
-        corpus_tokens = [tokenize(doc) for doc in retrieve_docs]
-        bm25 = BM25Okapi(corpus_tokens)
-        
-
-
-        def bm25search_impl(query: str, top_k: int = 8):
-            
-           
-            chunks = bm25_retrieve_for_recurrent_chunk(
-                query=query,
-                bm25_model=bm25,
-                retrieve_docs=retrieve_docs,
-                retrieve_meta=retrieve_meta,
-                top_k=4,
-                exclude_recurrent_idx=None,
+        prompt = item['input'].strip()
+        retrieve_doc_tokens = []
+        if bm25_impl == "legacy":
+            retrieve_docs, retrieve_meta = _build_retrieve_corpus_legacy(
+                input_ids=input_ids,
+                tokenizer=tokenizer,
+                recurrent_chunks=recurrent_chunks,
             )
-            
+            retrieve_doc_tokens = [tokenize_legacy(doc) for doc in retrieve_docs]
+            bm25 = BM25Okapi(retrieve_doc_tokens)
+        else:
+            retrieve_docs, retrieve_meta = _build_retrieve_corpus_enhanced(
+                input_ids=input_ids,
+                tokenizer=tokenizer,
+                recurrent_chunks=recurrent_chunks,
+            )
+            retrieve_doc_tokens = [tokenize_mixed(doc) for doc in retrieve_docs]
+            bm25 = BM25Okapi(retrieve_doc_tokens)
+
+        def bm25search_impl(query: str, top_k: int = 8, exclude_recurrent_idx: int | None = None):
+            if bm25_impl == "legacy":
+                # Keep legacy behavior unchanged for reproducible A/B comparison.
+                normalized_query = query
+                legacy_top_k = 4
+                chunks = bm25_retrieve_for_recurrent_chunk(
+                    query=normalized_query,
+                    bm25_model=bm25,
+                    retrieve_docs=retrieve_docs,
+                    retrieve_meta=retrieve_meta,
+                    top_k=legacy_top_k,
+                    exclude_recurrent_idx=None,
+                )
+                returned_top_k = top_k
+            else:
+                normalized_query = _normalize_query(query, prompt)
+                safe_top_k = _clamp_top_k(top_k)
+                chunks = bm25_retrieve_for_recurrent_chunk_enhanced(
+                    query=normalized_query,
+                    bm25_model=bm25,
+                    retrieve_docs=retrieve_docs,
+                    retrieve_meta=retrieve_meta,
+                    retrieve_doc_tokens=retrieve_doc_tokens,
+                    top_k=safe_top_k,
+                    exclude_recurrent_idx=exclude_recurrent_idx,
+                )
+                returned_top_k = safe_top_k
+
             return {
-                "top_k": top_k,
-                "query": query,
+                "top_k": returned_top_k,
+                "query": normalized_query,
                 "results": [
                     {
                         "rank": i + 1,
                         "text": txt,
-                        
                     }
                     for i, txt in enumerate(chunks)
                 ]
             }
-
-
-
-
-        prompt = item['input'].strip()
 
 
         TOP_K = 8 
@@ -693,6 +973,10 @@ async def async_query_llm_multi_turn(item, model, tokenizer, temperature=0.7, to
         max_retrieve_steps = len(recurrent_chunks)
 
         for retrieve_step in range(len(recurrent_chunks)):
+            loop_start = time.perf_counter()
+            loop_retrieval_s = 0.0
+            loop_retrieval_mem_delta_mb = 0.0
+            loop_retrieval_calls = 0
             rc = recurrent_chunks[retrieve_step]
             start, end = rc["start"], rc["end"]
             chunk_ids = input_ids[start:end]
@@ -768,7 +1052,20 @@ async def async_query_llm_multi_turn(item, model, tokenizer, temperature=0.7, to
                         {"role": "assistant", "content": final_answer}
                     ])
 
-                    return {"conversation": conversation, "final": final_answer, "step": retrieve_step+1,"max_step":max_retrieve_steps}
+                    loop_perf.append({
+                        "loop_idx": retrieve_step + 1,
+                        "loop_total_s": time.perf_counter() - loop_start,
+                        "retrieval_s": loop_retrieval_s,
+                        "retrieval_calls": loop_retrieval_calls,
+                        "retrieval_mem_delta_mb": loop_retrieval_mem_delta_mb,
+                    })
+                    return {
+                        "conversation": conversation,
+                        "final": final_answer,
+                        "step": retrieve_step + 1,
+                        "max_step": max_retrieve_steps,
+                        "perf": _build_perf(),
+                    }
 
 
             # === Case B: have function_call ===
@@ -789,13 +1086,28 @@ async def async_query_llm_multi_turn(item, model, tokenizer, temperature=0.7, to
                         top_k = TOP_K
                         method = "bm25"
                     history.append({"method": method, "query": query, "top_k": top_k})
-                    
-                    ret = bm25search_impl(query=query, top_k=top_k)
-                    
+
+                    mem_before = _get_rss_mb()
+                    retrieval_start = time.perf_counter()
+                    ret = bm25search_impl(
+                        query=query,
+                        top_k=top_k,
+                        exclude_recurrent_idx=rc["r_idx"] if bm25_impl == "enhanced" else None,
+                    )
                     retrieved_block = "\n\n".join(
                         f"[Retrieved #{r['rank']}] {r['text']}"
                         for r in ret["results"]
                     )
+                    retrieval_elapsed = time.perf_counter() - retrieval_start
+                    mem_after = _get_rss_mb()
+                    loop_retrieval_s += retrieval_elapsed
+                    retrieval_total_s += retrieval_elapsed
+                    loop_retrieval_calls += 1
+                    retrieval_calls += 1
+                    if mem_before is not None and mem_after is not None:
+                        mem_delta = mem_after - mem_before
+                        loop_retrieval_mem_delta_mb += mem_delta
+                        retrieval_mem_deltas_mb.append(mem_delta)
 
 
             msg_to_teacher = TEMPLATE_RETREIVE_RECURRENT.format(
@@ -824,6 +1136,13 @@ async def async_query_llm_multi_turn(item, model, tokenizer, temperature=0.7, to
             ])
 
             memory, _ = extract_solution(generation)
+            loop_perf.append({
+                "loop_idx": retrieve_step + 1,
+                "loop_total_s": time.perf_counter() - loop_start,
+                "retrieval_s": loop_retrieval_s,
+                "retrieval_calls": loop_retrieval_calls,
+                "retrieval_mem_delta_mb": loop_retrieval_mem_delta_mb,
+            })
 
             
         msg_final_to_teacher = TEMPLATE_FINAL.format(prompt=prompt, memory=memory)
@@ -835,5 +1154,10 @@ async def async_query_llm_multi_turn(item, model, tokenizer, temperature=0.7, to
         final_answer, _ = extract_solution(generation)
         conversation.append([{"role": "user", "content": msg_final_original_temp},{"role": "assistant", "content": final_answer}])
 
-        return {'conversation': conversation, 'final': final_answer,"step": max_retrieve_steps, "max_step":max_retrieve_steps}
-
+        return {
+            'conversation': conversation,
+            'final': final_answer,
+            "step": max_retrieve_steps,
+            "max_step": max_retrieve_steps,
+            "perf": _build_perf(),
+        }

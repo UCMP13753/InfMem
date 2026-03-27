@@ -1,6 +1,7 @@
 from .aio import get_async_client
 from utils import extract_solution
 from .envs import URL, API_KEY, RECURRENT_CHUNK_SIZE, RECURRENT_MAX_NEW, RECURRENT_MAX_CONTEXT_LEN, ENABLE_THINK
+import time
 
 from openai import AsyncOpenAI
 
@@ -8,7 +9,7 @@ from openai import AsyncOpenAI
 client = AsyncOpenAI(api_key=API_KEY)
 
 NO_MEMORY = "No previous memory"
-ENABLE_THINK = True
+ENABLE_THINK = False
 if ENABLE_THINK:
     RECURRENT_MAX_NEW = 1024
     
@@ -249,7 +250,9 @@ def extract_answer(item):
 
 async def async_query_llm_multi_turn(item, model, tokenizer, temperature=0.7, top_p=0.95, stop=None):
     # model="gpt-4o-mini"
-    
+    perf_sample_start = time.perf_counter()
+    loop_perf = []
+
     idx = item["_id"]
     context = item["context"].strip()
     prompt = item['input'].strip()
@@ -263,6 +266,7 @@ async def async_query_llm_multi_turn(item, model, tokenizer, temperature=0.7, to
             input_ids = input_ids[:max_len//2] + input_ids[-max_len//2:]
         memory = NO_MEMORY
         for i in range(0, len(input_ids), RECURRENT_CHUNK_SIZE):
+            loop_start = time.perf_counter()
             chunk = input_ids[i:i+RECURRENT_CHUNK_SIZE]
             msg_to_teacher = TEMPLATE.format(prompt=prompt, chunk=tokenizer.decode(chunk), memory=memory)
             msg_original_temp = ORIGINAL_TEMPLATE.format(prompt=prompt, chunk=tokenizer.decode(chunk), memory=memory)
@@ -284,6 +288,13 @@ async def async_query_llm_multi_turn(item, model, tokenizer, temperature=0.7, to
             )
             conversation.append([{"role": "user", "content": msg_original_temp},{"role": "assistant", "content": generation}])
             memory, _ = extract_solution(generation)
+            loop_perf.append({
+                "loop_idx": len(loop_perf) + 1,
+                "loop_total_s": time.perf_counter() - loop_start,
+                "retrieval_s": 0.0,
+                "retrieval_calls": 0,
+                "retrieval_mem_delta_mb": 0.0,
+            })
 
 
         msg_final_to_teacher = TEMPLATE_FINAL.format(prompt=prompt, memory=memory)
@@ -296,6 +307,23 @@ async def async_query_llm_multi_turn(item, model, tokenizer, temperature=0.7, to
         final_answer, _ = extract_solution(generation)
         conversation.append([{"role": "user", "content": msg_final_original_temp},{"role": "assistant", "content": final_answer}])
 
-
-        return {'conversation': conversation, 'final': final_answer}
-
+        sample_total_s = time.perf_counter() - perf_sample_start
+        avg_loop_s = (
+            sum(loop["loop_total_s"] for loop in loop_perf) / len(loop_perf)
+            if loop_perf
+            else 0.0
+        )
+        return {
+            'conversation': conversation,
+            'final': final_answer,
+            'perf': {
+                "sample_total_s": sample_total_s,
+                "avg_loop_s": avg_loop_s,
+                "retrieval_total_s": 0.0,
+                "retrieval_calls": 0,
+                "retrieval_mem_deltas_mb": [],
+                "retrieval_mem_delta_avg_mb": 0.0,
+                "retrieval_mem_delta_max_mb": 0.0,
+                "loops": loop_perf,
+            },
+        }
