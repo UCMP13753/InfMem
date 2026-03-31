@@ -36,7 +36,7 @@ PROMPT_GLOBAL_EVIDENCE = """Passages: {docs}\nYour job is to act as a profession
 PROMPT_LOCAL_PATHWAY = """Judging based solely on the current known information and without allowing for inference, are you able to respond completely and accurately to the question {sub_question}? \nKnown information: {combined_memory}.
 If yes, please reply with "Yes", followed by an accurate response to the question {sub_question}, without restating the question; if no, please reply with "No" directly."""
 
-PROMPT_GENERATOR = """Answer the question based on the given reference.\nOnly give me the answer and do not output any other words.\nThe following are given reference: {combined_memory}\nQuestion: {question}"""
+PROMPT_GENERATOR = """Answer the question based on the given reference.\nThe following are given reference: {combined_memory}\nQuestion: {question} Please answer the problem based on the given reference and format your response as follows "Therefore, the answer is (insert answer here)"""
 
 # ================= BM25 =================
 
@@ -265,14 +265,12 @@ def _strip_thinking_content(text: str) -> str:
         return clean_text[len("<think>"):].strip()
     return clean_text
 
-# ================= 核心：ReSP 主流程 =================
 
 async def async_query_llm(item, model, tokenizer, temperature=0.7, top_p=0.95, stop=None):
     context = item["context"]
     question = item['input'].strip()
     conversation = []
 
-    # 1. 准备全局文档与 BM25 索引
     input_ids = tokenizer.encode(context)
     if len(input_ids) > MAX_INPUT_LEN:
         input_ids = input_ids[:MAX_INPUT_LEN//2] + input_ids[-MAX_INPUT_LEN//2:]
@@ -284,12 +282,11 @@ async def async_query_llm(item, model, tokenizer, temperature=0.7, top_p=0.95, s
     retrieve_doc_tokens = [tokenize_mixed(doc) for doc in retrieve_docs]
     bm25 = BM25Okapi(retrieve_doc_tokens)
 
-    # 2. 初始化 ReSP 的双重记忆队列
     global_evidence_memory = []
     local_pathway_memory = []
 
     for iteration in range(MAX_ITERATIONS):
-        # 拼接 Combined memory queues
+        # Combined memory queues
         combined_memory = "\n".join(global_evidence_memory + local_pathway_memory)
         if not combined_memory.strip():
             combined_memory = "None"
@@ -301,7 +298,7 @@ async def async_query_llm(item, model, tokenizer, temperature=0.7, top_p=0.95, s
         conversation.append([{"role": "user", "content": "JUDGE:\n" + judge_p}, {"role": "assistant", "content": judge_raw}])
         
         if judge_res.lower().startswith("yes"):
-            break # 记忆足以回答总问题，跳出循环进入 Generator
+            break 
 
         # --- Module 2: Reasoner (Plan) ---
         reasoner_p = PROMPT_REASONER.format(combined_memory=combined_memory, question=question)
@@ -327,13 +324,11 @@ async def async_query_llm(item, model, tokenizer, temperature=0.7, top_p=0.95, s
         global_p = PROMPT_GLOBAL_EVIDENCE.format(docs=docs_str, question=question)
         global_raw = await _async_call_llm(global_p, model, tokenizer, temperature=0.3, top_p=top_p, stop=stop)
         global_res = _strip_thinking_content(global_raw)
-        # 清理原文要求的 [DONE] 标记
         clean_global_res = global_res.replace("[DONE]", "").strip()
         if clean_global_res:
             global_evidence_memory.append(f"Global Evidence: {clean_global_res}")
         conversation.append([{"role": "user", "content": "GLOBAL SUMMARIZER:\n" + global_p}, {"role": "assistant", "content": global_raw}])
 
-        # 更新 combined memory 供 Local Pathway 使用
         combined_memory_updated = "\n".join(global_evidence_memory + local_pathway_memory)
 
         # --- Module 4: Local Pathway Summarizer ---
@@ -341,9 +336,8 @@ async def async_query_llm(item, model, tokenizer, temperature=0.7, top_p=0.95, s
         local_raw = await _async_call_llm(local_p, model, tokenizer, temperature=0.1, top_p=top_p, stop=stop)
         local_res = _strip_thinking_content(local_raw)
         
-        # 按照原文逻辑解析 "Yes" 或 "No"
         if local_res.lower().startswith("yes"):
-            answer = local_res[3:].strip() # 截去 "Yes"
+            answer = local_res[3:].strip() 
             if answer.startswith(","): answer = answer[1:].strip()
             local_pathway_memory.append(f"Q: {sub_question} -> A: {answer}")
         else:

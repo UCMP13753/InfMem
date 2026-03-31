@@ -76,8 +76,8 @@ def get_pred_with_conversation_trace(data, args, out_file):
     elif args.api == "rag":
         from utils.openai_retrieval import async_query_llm as async_query_llm
         from utils import extract_answer
-    elif args.api in {"resq", "resp"}:
-        from utils.resq import async_query_llm as async_query_llm
+    elif args.api in {"resp"}:
+        from utils.resp import async_query_llm as async_query_llm
         from utils import extract_answer
     else:
         print(f"Invalid API: {args.api}")
